@@ -42,6 +42,9 @@ class Config:
     request_plane: str
     enable_local_indexer: bool = False
 
+    # checkpoint support
+    checkpoint_mode: bool = False
+
     # mirror vLLM
     model: str
     served_model_name: Optional[str]
@@ -218,6 +221,11 @@ def parse_args() -> Config:
         default=False,
         help="Use vLLM's tokenizer for pre and post processing. This bypasses Dynamo's preprocessor and only v1/chat/completions will be available through the Dynamo frontend.",
     )
+    parser.add_argument(
+        "--checkpoint-mode",
+        action="store_true",
+        help="Enable checkpoint mode: pause after model load to allow container checkpointing before registering endpoints. Send SIGUSR1 to proceed after restore.",
+    )
     add_config_dump_args(parser)
 
     parser = AsyncEngineArgs.add_cli_args(parser)
@@ -329,6 +337,7 @@ def parse_args() -> Config:
     config.request_plane = args.request_plane
     config.enable_local_indexer = args.enable_local_indexer
     config.use_vllm_tokenizer = args.use_vllm_tokenizer
+    config.checkpoint_mode = args.checkpoint_mode
 
     # Validate custom Jinja template file exists if provided
     if config.custom_jinja_template is not None:
