@@ -123,6 +123,12 @@ DYNAMO_ARGS: Dict[str, Dict[str, Any]] = {
         "default": os.environ.get("DYN_LOCAL_INDEXER", "false"),
         "help": "Enable worker-local KV indexer for tracking this worker's own KV cache state (can also be toggled with env var DYN_LOCAL_INDEXER).",
     },
+    "checkpoint-mode": {
+        "flags": ["--checkpoint-mode"],
+        "action": "store_true",
+        "default": False,
+        "help": "Enable checkpoint mode: pause after model load to allow container checkpointing before registering endpoints. Send SIGUSR1 to proceed after restore.",
+    },
 }
 
 
@@ -157,6 +163,9 @@ class DynamoArgs:
     dump_config_to: Optional[str] = None
     # local indexer option
     enable_local_indexer: bool = False
+
+    # checkpoint support
+    checkpoint_mode: bool = False
 
 
 class DisaggregationMode(Enum):
@@ -487,6 +496,7 @@ async def parse_args(args: list[str]) -> Config:
         embedding_worker=parsed_args.embedding_worker,
         dump_config_to=parsed_args.dump_config_to,
         enable_local_indexer=str(parsed_args.enable_local_indexer).lower() == "true",
+        checkpoint_mode=parsed_args.checkpoint_mode,
     )
     logging.debug(f"Dynamo args: {dynamo_args}")
 
