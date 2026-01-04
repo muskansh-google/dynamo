@@ -282,9 +282,16 @@ where
                 m.response_bytes.inc_by(resp_bytes.len() as u64);
             }
             if (publisher.send(resp_bytes.into()).await).is_err() {
+                send_complete_final = false;
+                // If context is already stopped (e.g., stop word detected at the frontend), the
+                // client likely closed the connection after receiving the complete response from
+                // frontend. This is expected.
+                if context.is_stopped() {
+                    break;
+                }
+                // Otherwise, this is an error.
                 tracing::error!("Failed to publish response for stream {}", context.id());
                 context.stop_generating();
-                send_complete_final = false;
                 if let Some(m) = self.metrics() {
                     m.error_counter
                         .with_label_values(&[work_handler::error_types::PUBLISH_RESPONSE])
