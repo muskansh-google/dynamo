@@ -122,9 +122,20 @@ async def worker():
         # Set up vLLM engine (loads model into GPU)
         # Note: stat_logger not available yet, will be None for checkpoint mode
         pre_created_engine = setup_vllm_engine(config)
+        engine_client = pre_created_engine[0]
+
+        # Put model to sleep before checkpoint (if sleep mode enabled)
+        if config.engine_args.enable_sleep_mode:
+            logger.info(f"Putting model to sleep (level={config.sleep_mode_level})")
+            engine_client.sleep(level=config.sleep_mode_level)
 
         # Wait for checkpoint signal BEFORE creating runtime
         await wait_for_checkpoint(config)
+
+        # Wake up model after restore (if sleep mode enabled)
+        if config.engine_args.enable_sleep_mode:
+            logger.info("Waking up model")
+            engine_client.wake_up()
 
     # Create runtime (fresh ETCD/NATS connections in checkpoint mode)
     runtime = DistributedRuntime(loop, config.store_kv, config.request_plane)
