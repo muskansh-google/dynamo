@@ -471,6 +471,7 @@ COPY --chown=dynamo: --from=wheel_builder /opt/dynamo/dist/*.whl /opt/dynamo/whe
 
 # Install Python for framework=none runtime (cuda-dl-base doesn't include Python)
 # This is needed to create venv and install dynamo packages
+ARG PYTHON_VERSION
 RUN apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         python${PYTHON_VERSION}-dev \
@@ -479,36 +480,19 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/* && \
     ln -sf /usr/bin/python${PYTHON_VERSION} /usr/bin/python3
 
-# Switch to dynamo user and use login shell to pick up umask 002
+# Switch to dynamo user and create virtual environment
 USER dynamo
 ENV HOME=/home/dynamo
-# Use login shell to pick up umask 002 from /etc/profile.d/00-umask.sh for subsequent RUN commands
+
+# Create and activate virtual environment
+# Use login shell to pick up umask 002 from /etc/profile.d/00-umask.sh for group-writable files
 SHELL ["/bin/bash", "-l", "-o", "pipefail", "-c"]
+RUN uv venv /opt/dynamo/venv --python ${PYTHON_VERSION}
 
-# Create virtual environment and install dynamo wheels for framework=none runtime
-# This ensures runtime components are available for sanity checks and basic usage
-# Note: umask 002 (set above) ensures pip creates group-writable files automatically
-RUN mkdir -p /opt/dynamo && \
-    python3 -m venv /opt/dynamo/venv && \
-    /opt/dynamo/venv/bin/pip install --no-cache-dir \
-        /opt/dynamo/wheelhouse/ai_dynamo_runtime*.whl \
-        /opt/dynamo/wheelhouse/ai_dynamo*any.whl \
-        /opt/dynamo/wheelhouse/nixl/nixl*.whl
-
-# Activate virtual environment
 ENV VIRTUAL_ENV=/opt/dynamo/venv \
     PATH="/opt/dynamo/venv/bin:${PATH}"
 
-# Install common and test dependencies
-RUN --mount=type=bind,source=./container/deps/requirements.txt,target=/tmp/requirements.txt \
-    --mount=type=bind,source=./container/deps/requirements.test.txt,target=/tmp/requirements.test.txt \
-    UV_GIT_LFS=1 uv pip install \
-        --no-cache \
-        --requirement /tmp/requirements.txt \
-        --requirement /tmp/requirements.test.txt
-
-COPY --chown=dynamo: ./ /workspace/
-
+# Install dynamo wheels (runtime packages only, no test dependencies)
 ARG ENABLE_KVBM
 RUN uv pip install \
     /opt/dynamo/wheelhouse/ai_dynamo_runtime*.whl \
@@ -521,24 +505,10 @@ RUN uv pip install \
             exit 1; \
         fi; \
         uv pip install "$KVBM_WHEEL"; \
-    fi && \
-    cd /workspace/benchmarks && \
-    UV_GIT_LFS=1 uv pip install --no-cache .
-
-# Setup launch banner in common directory accessible to all users
-RUN --mount=type=bind,source=./container/launch_message/runtime.txt,target=/opt/dynamo/launch_message.txt \
-    sed '/^#\s/d' /opt/dynamo/launch_message.txt > /opt/dynamo/.launch_screen
-
-# Setup environment for all users
-USER root
-RUN chmod 755 /opt/dynamo/.launch_screen && \
-    echo 'source /opt/dynamo/venv/bin/activate' >> /etc/bash.bashrc && \
-    echo 'cat /opt/dynamo/.launch_screen' >> /etc/bash.bashrc
+    fi
 
 ARG DYNAMO_COMMIT_SHA
 ENV DYNAMO_COMMIT_SHA=$DYNAMO_COMMIT_SHA
-
-USER dynamo
 
 ENTRYPOINT ["/opt/nvidia/nvidia_entrypoint.sh"]
 CMD []

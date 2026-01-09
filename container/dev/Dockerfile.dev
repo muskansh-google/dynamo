@@ -341,17 +341,6 @@ RUN chmod g+w ${WORKSPACE_DIR}
 RUN cd ${WORKSPACE_DIR}/benchmarks && \
     UV_GIT_LFS=1 uv pip install --no-cache .
 
-# Install KVBM wheel if enabled (matches framework Dockerfile dev stages)
-ARG ENABLE_KVBM
-RUN if [ "${ENABLE_KVBM}" = "true" ]; then \
-        KVBM_WHEEL=$(ls /opt/dynamo/wheelhouse/kvbm*.whl 2>/dev/null | head -1); \
-        if [ -z "$KVBM_WHEEL" ]; then \
-            echo "ERROR: ENABLE_KVBM is true but no KVBM wheel found in wheelhouse" >&2; \
-            exit 1; \
-        fi; \
-        uv pip install --no-cache "$KVBM_WHEEL"; \
-    fi
-
 # Install maturin and create editable install entry points.
 #
 # Why the `uv` check:
