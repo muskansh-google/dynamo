@@ -44,49 +44,45 @@ from .publisher import StatLoggerFactory
 configure_dynamo_logging()
 logger = logging.getLogger(__name__)
 
-# Global event for checkpoint proceed signal (SIGUSR1)
-_checkpoint_proceed_event: Optional[asyncio.Event] = None
 
-
-def _handle_checkpoint_proceed(signum, frame):
-    """Handle SIGUSR1 signal to proceed after checkpoint restore."""
-    logger.info("Received SIGUSR1 signal, proceeding with endpoint registration")
-    if _checkpoint_proceed_event is not None:
-        # Set the event in a thread-safe way
-        loop = asyncio.get_event_loop()
-        loop.call_soon_threadsafe(_checkpoint_proceed_event.set)
-
-
-async def wait_for_checkpoint(config):
+async def wait_for_checkpoint_signal_file(signal_file: str) -> bool:
     """
-    Wait for checkpoint/restore cycle in checkpoint mode.
+    Wait for checkpoint signal file OR restore marker file.
 
-    When --checkpoint-mode is enabled:
-    1. Logs CHECKPOINT_READY message (external script can grep for this)
-    2. Waits for SIGUSR1 signal before proceeding with endpoint registration
+    In checkpoint creation mode, poll until either:
+    1. The signal file exists (checkpoint complete, should exit)
+    2. The restore marker file exists (restored by CRIU, should proceed)
 
-    This allows container checkpointing after model load but before network
-    connections (ETCD/NATS) are established.
+    The restore marker file is created by the restore-entrypoint before CRIU restore,
+    so the restored process can detect it was restored even though os.environ is
+    restored from the checkpoint and doesn't contain new container env vars.
+
+    Args:
+        signal_file: Path to the checkpoint signal file
+
+    Returns:
+        True if restored (should proceed with registration)
+        False if signal file detected (should exit)
     """
-    global _checkpoint_proceed_event
+    # Get restore marker file path (created by restore entrypoint before CRIU restore)
+    restore_marker = os.environ.get("DYNAMO_RESTORE_MARKER_FILE", "/tmp/dynamo-restored")
 
-    if not config.checkpoint_mode:
-        return
-
-    # Create the event for this checkpoint wait
-    _checkpoint_proceed_event = asyncio.Event()
-
-    # Register signal handler for proceed signal
-    signal.signal(signal.SIGUSR1, _handle_checkpoint_proceed)
-
-    # Log the ready message (external script can grep for this)
     logger.info("CHECKPOINT_READY: Model loaded, ready for container checkpoint")
-    logger.info("CHECKPOINT_READY: Send SIGUSR1 to proceed after restore (e.g., podman kill -s SIGUSR1 <container>)")
+    logger.info(f"CHECKPOINT_READY: Waiting for signal file: {signal_file}")
+    logger.info(f"CHECKPOINT_READY: Or restore marker file: {restore_marker}")
 
-    # Wait for SIGUSR1 signal
-    await _checkpoint_proceed_event.wait()
+    while True:
+        # Check if we've been restored (marker file created by restore entrypoint)
+        if os.path.exists(restore_marker):
+            logger.info(f"Detected restore from checkpoint (marker file exists: {restore_marker})")
+            return True  # Restored - proceed with registration
 
-    logger.info("Proceeding with endpoint registration after checkpoint restore")
+        # Check if checkpoint is complete (signal file exists)
+        if os.path.exists(signal_file):
+            logger.info(f"Checkpoint signal file detected: {signal_file}")
+            return False  # Checkpoint done - exit
+
+        await asyncio.sleep(1)
 
 
 async def graceful_shutdown(runtime):
@@ -106,10 +102,20 @@ async def worker():
 
     loop = asyncio.get_running_loop()
 
+    # Check checkpoint-related environment variables
+    signal_file = os.environ.get("DYNAMO_CHECKPOINT_SIGNAL_FILE")
+    ready_file = os.environ.get("DYNAMO_CHECKPOINT_READY_FILE")
+
+    is_checkpoint_mode = signal_file is not None
+
     # CHECKPOINT MODE: Load model BEFORE runtime creation
-    # This allows checkpointing GPU state before ETCD/NATS connections are established
+    # This allows checkpointing GPU state before connections are established
     pre_created_engine = None
-    if config.checkpoint_mode:
+    is_restored = False
+    if is_checkpoint_mode:
+        # CHECKPOINT MODE: Load model, sleep, wait for signal file or restore
+        logger.info(f"Checkpoint mode enabled (DYNAMO_CHECKPOINT_SIGNAL_FILE={signal_file})")
+
         # Prepare config and download model
         overwrite_args(config)
         if not config.served_model_name:
@@ -129,19 +135,31 @@ async def worker():
             logger.info(f"Putting model to sleep (level={config.sleep_mode_level})")
             engine_client.sleep(level=config.sleep_mode_level)
 
-        # Wait for checkpoint signal BEFORE creating runtime
-        await wait_for_checkpoint(config)
+        # Write ready file to signal that we're ready for checkpointing
+        if ready_file:
+            with open(ready_file, "w") as f:
+                f.write("ready")
+            logger.info(f"Wrote checkpoint ready file: {ready_file}")
 
-        # Wake up model after restore (if sleep mode enabled)
-        if config.engine_args.enable_sleep_mode:
-            logger.info("Waking up model")
-            engine_client.wake_up()
+        # Wait for checkpoint signal file OR restore detection
+        is_restored = await wait_for_checkpoint_signal_file(signal_file)
 
-    # Create runtime (fresh ETCD/NATS connections in checkpoint mode)
+        if is_restored:
+            # Wake up model and proceed with registration
+            if config.engine_args.enable_sleep_mode:
+                logger.info("Waking up model after checkpoint restore")
+                engine_client.wake_up()
+            logger.info("Proceeding with endpoint registration after restore")
+        else:
+            # Checkpoint complete, exit
+            logger.info("Exiting after checkpoint completion")
+            return
+
+    # Create runtime (connections after restore, or normal mode)
     runtime = DistributedRuntime(loop, config.store_kv, config.request_plane)
 
     # NORMAL MODE: overwrite_args and model download happen here
-    if not config.checkpoint_mode:
+    if not is_checkpoint_mode:
         overwrite_args(config)
 
         # Download the model if necessary.

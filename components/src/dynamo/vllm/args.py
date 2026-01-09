@@ -42,9 +42,6 @@ class Config:
     request_plane: str
     enable_local_indexer: bool = False
 
-    # checkpoint support
-    checkpoint_mode: bool = False
-
     # sleep mode support (enable_sleep_mode comes from vLLM's engine_args)
     sleep_mode_level: int = 1
 
@@ -225,11 +222,6 @@ def parse_args() -> Config:
         help="Use vLLM's tokenizer for pre and post processing. This bypasses Dynamo's preprocessor and only v1/chat/completions will be available through the Dynamo frontend.",
     )
     parser.add_argument(
-        "--checkpoint-mode",
-        action="store_true",
-        help="Enable checkpoint mode: pause after model load to allow container checkpointing before registering endpoints. Send SIGUSR1 to proceed after restore.",
-    )
-    parser.add_argument(
         "--sleep-mode-level",
         type=int,
         default=1,
@@ -347,7 +339,6 @@ def parse_args() -> Config:
     config.request_plane = args.request_plane
     config.enable_local_indexer = args.enable_local_indexer
     config.use_vllm_tokenizer = args.use_vllm_tokenizer
-    config.checkpoint_mode = args.checkpoint_mode
     config.sleep_mode_level = args.sleep_mode_level
 
     # Validate custom Jinja template file exists if provided
@@ -463,14 +454,6 @@ def create_kv_transfer_config(config: Config) -> Optional[KVTransferConfig]:
 
     logger.info(f"Creating kv_transfer_config from --connector {config.connector_list}")
 
-    # Enable lazy init for checkpoint mode to defer NIXL/UCX socket binding
-    # until after container restore (when the container has a new IP)
-    lazy_init = getattr(config, "checkpoint_mode", False)
-    if lazy_init:
-        logger.info(
-            "Checkpoint mode enabled: KV connector will use lazy_init=True "
-            "to defer network binding until after restore"
-        )
 
     # Create connector configs in specified order
     multi_connectors = []
@@ -490,7 +473,7 @@ def create_kv_transfer_config(config: Config) -> Optional[KVTransferConfig]:
     # For single connector, return direct config
     if len(multi_connectors) == 1:
         cfg = multi_connectors[0]
-        return KVTransferConfig(**cfg, lazy_init=lazy_init)
+        return KVTransferConfig(**cfg)
 
     # For multiple connectors, use PdConnector
     return KVTransferConfig(
@@ -498,7 +481,6 @@ def create_kv_transfer_config(config: Config) -> Optional[KVTransferConfig]:
         kv_role="kv_both",
         kv_connector_extra_config={"connectors": multi_connectors},
         kv_connector_module_path="kvbm.vllm_integration.connector",
-        lazy_init=lazy_init,
     )
 
 
