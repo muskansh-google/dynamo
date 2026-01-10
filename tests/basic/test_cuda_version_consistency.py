@@ -56,7 +56,7 @@ def major_from_text(text: str) -> int | None:
         r"\brelease\s+([1-9]\d)\.",             # nvcc: release 10.0
         r"-([1-9]\d)-\d+\b",                    # dpkg: ...-10-0
         r"\bcuda([1-9]\d)x\b",                  # cupy-cuda10x (from name)
-        r"[-+]cu(1)([0-9])\d?\b",               # -cu100 or +cu129 (CUDA 10-19) - capture first 2 digits separately
+        r"[-+]cu([1-9])([0-9])\d?\b",           # -cu100 or +cu129 (CUDA 10-99) - capture first 2 digits separately
     ]
     # fmt: on
     for i, pat in enumerate(pats):
@@ -64,7 +64,7 @@ def major_from_text(text: str) -> int | None:
         if m:
             # Special handling for cu### pattern (last pattern)
             if i == len(pats) - 1 and len(m.groups()) >= 2:
-                # cu129 -> major=12 (first two digits)
+                # cu129 -> major=12, cu200 -> major=20 (first two digits)
                 maj = int(m.group(1) + m.group(2))
             else:
                 maj = int(m.group(1))
