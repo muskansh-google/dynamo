@@ -8,15 +8,21 @@ Dynamo System Information Checker
 Diagnostic tool that displays system configuration and Dynamo project status
 in a hierarchical tree format. This script checks for:
 
+Default checks:
 - System resources (OS, CPU, memory, GPU)
 - Container/host context (execution context, /dev/shm sizing, selected env)
 - Development tools (Cargo/Rust, Maturin, Python)
 - LLM frameworks (vllm, sglang, tensorrt_llm)
 - Dynamo runtime and framework components
-- File system (permissions and disk space, more detail with --thorough-check)
-- HuggingFace model cache (more detail with --thorough-check)
-- CUDA major version consistency (with --thorough-check)
 - Installation status and component availability
+
+Additional checks with --thorough-check:
+- File system permissions (file-level analysis)
+- Directory sizes and disk space
+- Ulimits (resource limits)
+- CUDA major version consistency (10+ signals: nvidia-smi, nvcc, env vars, dpkg, pip)
+- DYN_* environment variables
+- HuggingFace model cache details
 
 IMPORTANT: This script is STANDALONE and uses only Python stdlib (no Dynamo components).
 
@@ -32,11 +38,6 @@ The output uses status indicators:
 - ⚠️ Warning condition
 - ❓ Component not found (for optional items)
 
-By default, the tool runs quickly by checking only directory permissions and skipping
-size calculations. Use --thorough-check for detailed file-level permission analysis,
-directory size information, disk space checking, ulimit information, CUDA version
-consistency checking, and DYN_* env.
-
 `--json-output` prints a minified JSON tree (terse subset) for copy/paste into issues.
 
 Exit codes:
@@ -51,7 +52,9 @@ System info (hostname=jensen-linux, IP=10.111.122.133)
 │  ├─ DYNAMO_COMMIT_SHA: <sha or "not set">
 │  └─ Shared memory (/dev/shm): <used/total/avail>
 ├─ User info: user=ubuntu, uid=1000, gid=1000
-├─ ✅ NVIDIA GPU NVIDIA RTX 6000 Ada Generation, driver 570.133.07, CUDA 12.8, Power=26.14/300.00 W, Memory=289/49140 MiB
+├─ ✅ NVIDIA GPU: NVIDIA RTX 6000 Ada Generation, Power=23.25/300.00 W, Memory=289/49140 MiB
+│  ├─ Driver version: 570.133.07
+│  └─ nvidia-smi CUDA: 12.8 (driver max supported)
 ├─ 🤖Framework
 │  ├─ ✅ vLLM: 0.10.1.1, module=/opt/vllm/vllm/__init__.py, exec=/opt/dynamo/venv/bin/vllm
 │  └─ ✅ Sglang: 0.3.0, module=/opt/sglang/sglang/__init__.py
@@ -62,37 +65,74 @@ System info (hostname=jensen-linux, IP=10.111.122.133)
 │  ├─ ✅ Cargo home ($HOME/.cargo) writable
 │  ├─ ✅ Cargo target ($HOME/dynamo/.build/target) writable
 │  └─ ✅ Python site-packages ($HOME/dynamo/venv/lib/python3.12/site-packages) writable
-├─ ✅ Hugging Face Cache 3 models in ~/.cache/huggingface/hub
-├─ ✅ Cargo $HOME/.cargo/bin/cargo, cargo 1.89.0 (c24e10642 2025-06-23)
-│  ├─ Cargo home directory CARGO_HOME=$HOME/.cargo
-│  └─ Cargo target directory CARGO_TARGET_DIR=$HOME/dynamo/.build/target
-│     ├─ Debug $HOME/dynamo/.build/target/debug, modified=2025-08-30 16:26:49 PDT
-│     ├─ Release $HOME/dynamo/.build/target/release, modified=2025-08-30 18:21:12 PDT
-│     └─ Binary $HOME/dynamo/.build/target/debug/libdynamo_llm_capi.so, modified=2025-08-30 16:25:37 PDT
-├─ ✅ Maturin /opt/dynamo/venv/bin/maturin, maturin 1.9.3
-├─ ✅ Python 3.12.3, /opt/dynamo/venv/bin/python
-│  ├─ ✅ PyTorch 2.7.1+cu128, ✅torch.cuda.is_available
-│  └─ PYTHONPATH not set
-└─ Dynamo $HOME/dynamo
+├─ ✅ Hugging Face Cache: 3 models in ~/.cache/huggingface/hub (host mount)
+├─ ✅ Cargo: $HOME/.cargo/bin/cargo, cargo 1.89.0 (c24e10642 2025-06-23)
+│  ├─ Cargo home directory: CARGO_HOME=$HOME/.cargo
+│  └─ Cargo target directory: CARGO_TARGET_DIR=$HOME/dynamo/.build/target
+│     ├─ Debug: $HOME/dynamo/.build/target/debug, modified=2025-08-30 16:26:49 PDT
+│     ├─ Release: $HOME/dynamo/.build/target/release, modified=2025-08-30 18:21:12 PDT
+│     └─ Binary: $HOME/dynamo/.build/target/debug/libdynamo_llm_capi.so, modified=2025-08-30 16:25:37 PDT
+├─ ✅ Maturin: /opt/dynamo/venv/bin/maturin, maturin 1.9.3
+├─ ✅ Python: 3.12.3, /opt/dynamo/venv/bin/python
+│  ├─ ✅ PyTorch: 2.7.1+cu128, ✅torch.cuda.is_available
+│  └─ PYTHONPATH: not set
+└─ Dynamo: $HOME/dynamo
    ├─ Git HEAD: a03d29066, branch=main, Date: 2025-08-30 16:22:29 PDT
-   ├─ ✅ Runtime components ai-dynamo-runtime 0.4.1
-   │  │  /opt/dynamo/venv/lib/python3.12/site-packages/ai_dynamo_runtime-0.4.1.dist-info: created=2025-08-30 19:14:29 PDT
-   │  │  /opt/dynamo/venv/lib/python3.12/site-packages/ai_dynamo_runtime.pth: modified=2025-08-30 19:14:29 PDT
-   │  │  └─ →: $HOME/dynamo/lib/bindings/python/src
-   │  ├─ ✅ dynamo._core             $HOME/dynamo/lib/bindings/python/src/dynamo/_core.cpython-312-x86_64-linux-gnu.so, modified=2025-08-30 19:14:29 PDT
+   ├─ ✅ Runtime components: ai-dynamo-runtime 0.4.1
+   │  ├─ ✅ dynamo._core             $HOME/dynamo/lib/bindings/python/src/dynamo/_core.cpython-312-x86_64-linux-gnu.so
    │  ├─ ✅ dynamo.logits_processing $HOME/dynamo/lib/bindings/python/src/dynamo/logits_processing/__init__.py
    │  ├─ ✅ dynamo.nixl_connect      $HOME/dynamo/lib/bindings/python/src/dynamo/nixl_connect/__init__.py
    │  ├─ ✅ dynamo.llm               $HOME/dynamo/lib/bindings/python/src/dynamo/llm/__init__.py
    │  └─ ✅ dynamo.runtime           $HOME/dynamo/lib/bindings/python/src/dynamo/runtime/__init__.py
-   └─ ✅ Framework components ai-dynamo 0.5.0
-      │  /opt/dynamo/venv/lib/python3.12/site-packages/ai_dynamo-0.5.0.dist-info: created=2025-09-05 16:20:35 PDT
+   └─ ✅ Framework components: ai-dynamo 0.5.0
       ├─ ✅ dynamo.frontend  $HOME/dynamo/components/src/dynamo/frontend/__init__.py
       ├─ ✅ dynamo.llama_cpp $HOME/dynamo/components/src/dynamo/llama_cpp/__init__.py
-      ├─ ✅ dynamo.mocker    $HOME/dynamo/components/src/dynamo/mocker/__init__.py
-      ├─ ✅ dynamo.planner   $HOME/dynamo/components/src/dynamo/planner/__init__.py
       ├─ ✅ dynamo.sglang    $HOME/dynamo/components/src/dynamo/sglang/__init__.py
       ├─ ✅ dynamo.trtllm    $HOME/dynamo/components/src/dynamo/trtllm/__init__.py
       └─ ✅ dynamo.vllm      $HOME/dynamo/components/src/dynamo/vllm/__init__.py
+
+Additional output with --thorough-check:
+
+├─ File System
+│  ├─ ✅ Dynamo workspace ($HOME/dynamo) writable, size=1.2 GiB, disk=500 GiB free
+│  │  ├─ Total files: 1234, Total dirs: 567
+│  │  └─ Writable files: 1234, Writable dirs: 567
+│  └─ ... (similar detail for other directories)
+├─ ✅ Hugging Face Cache: 3 models in ~/.cache/huggingface/hub (host mount)
+│  ├─ Model 1: meta-llama/Llama-2-7b-hf, downloaded=2025-01-05, size=13.5 GiB
+│  ├─ Model 2: meta-llama/Llama-2-13b-hf, downloaded=2025-01-06, size=26.0 GiB
+│  └─ Model 3: mistralai/Mistral-7B-v0.1, downloaded=2025-01-07, size=14.5 GiB
+├─ ✅ NVIDIA GPU: NVIDIA RTX 6000 Ada Generation, Power=23.25/300.00 W, Memory=289/49140 MiB
+│  ├─ Driver version: 570.133.07
+│  ├─ nvidia-smi CUDA: 12.8 (driver max supported)
+│  ├─ nvcc CUDA: 12.9 (installed toolkit)
+│  └─ ✅ CUDA major version consistency: CUDA 12 (consistent across all signals), Checked signals=10
+│     ├─ 12.8  nvidia-smi (driver max): NVIDIA-SMI 570.133.07, Driver 570.133.07, CUDA 12.8
+│     ├─ 12.9  nvcc (installed toolkit): Cuda compilation tools, release 12.9, V12.9.41
+│     ├─ 12.9  CUDA_VERSION=12.9.0
+│     ├─ 12.9  NV_CUDA_CUDART_VERSION=12.9.37-1
+│     ├─ 12.9  NV_CUDA_LIB_VERSION=12.9.0-1
+│     ├─ 12.9  NV_LIBNCCL_PACKAGE=libnccl2=2.26.5-1+cuda12.9
+│     ├─ 12.9  NVIDIA_REQUIRE_CUDA=cuda>=12.9 brand=unknown,driver>=535...
+│     ├─ 12.9  dpkg:cuda-*
+│     │  ├─ ii  cuda-command-line-tools-12-9    12.9.1-1
+│     │  ├─ ii  cuda-cudart-12-9                12.9.37-1
+│     │  └─ ... (more packages)
+│     ├─ 12.9  dpkg:libcublas/libnccl
+│     │  └─ hi  libcublas-12-9                  12.9.0.13-1
+│     └─   12  pip:selected
+│        ├─ nvidia-cublas-cu12==12.9.1.4
+│        ├─ nvidia-cudnn-cu12==9.10.2.21
+│        ├─ torch==2.9.0+cu129
+│        └─ ... (more packages)
+├─ Ulimits
+│  ├─ Max open files: 1048576
+│  ├─ Max processes: 257698
+│  ├─ Stack size: 8388608 bytes
+│  └─ Core file size: unlimited
+└─ DYN_* environment variables
+   ├─ DYN_VAR1=value1
+   └─ DYN_VAR2=value2
 
 Usage:
     python deploy/sanity_check.py [--thorough-check] [--terse] [--runtime-check-only] [--json-output] [--cuda-consistency-check-only]
