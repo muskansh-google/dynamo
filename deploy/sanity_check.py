@@ -15,6 +15,7 @@ in a hierarchical tree format. This script checks for:
 - Dynamo runtime and framework components
 - File system (permissions and disk space, more detail with --thorough-check)
 - HuggingFace model cache (more detail with --thorough-check)
+- CUDA major version consistency (with --thorough-check)
 - Installation status and component availability
 
 IMPORTANT: This script is STANDALONE and uses only Python stdlib (no Dynamo components).
@@ -33,7 +34,8 @@ The output uses status indicators:
 
 By default, the tool runs quickly by checking only directory permissions and skipping
 size calculations. Use --thorough-check for detailed file-level permission analysis,
-directory size information, disk space checking, ulimit information, and DYN_* env.
+directory size information, disk space checking, ulimit information, CUDA version
+consistency checking, and DYN_* env.
 
 `--json-output` prints a minified JSON tree (terse subset) for copy/paste into issues.
 
@@ -93,16 +95,18 @@ System info (hostname=jensen-linux, IP=10.111.122.133)
       └─ ✅ dynamo.vllm      $HOME/dynamo/components/src/dynamo/vllm/__init__.py
 
 Usage:
-    python deploy/sanity_check.py [--thorough-check] [--terse] [--runtime-check] [--json-output]
+    python deploy/sanity_check.py [--thorough-check] [--terse] [--runtime-check-only] [--json-output] [--cuda-consistency-check-only]
 
 Options:
-    --thorough-check  Enable thorough checking (file permissions, directory sizes, disk space, ulimits, DYN_* env, HuggingFace model details)
-    --terse           Enable terse output mode (show only essential info and errors)
-    --json-output     Output a JSON representation (terse subset) suitable for copy/paste
-    --runtime-check   Skip compile-time dependency checks (Rust, Cargo, Maturin) for runtime containers
-                      and validate ai-dynamo packages (ai-dynamo-runtime and ai-dynamo)
-    --no-gpu-check    Skip GPU detection and information collection (useful for environments without GPU access)
-    --no-framework-check Skip LLM framework package checks (vllm, sglang, tensorrt_llm)
+    --thorough-check              Enable thorough checking (file permissions, directory sizes, disk space, ulimits, CUDA major version consistency, DYN_* env, HuggingFace model details)
+    --terse                       Enable terse output mode (show only essential info and errors)
+    --json-output                 Output a JSON representation (terse subset) suitable for copy/paste
+    --runtime-check-only          Skip compile-time dependency checks (Rust, Cargo, Maturin) for runtime containers
+                                  and validate ai-dynamo packages (ai-dynamo-runtime and ai-dynamo)
+    --no-gpu-check                Skip GPU detection and information collection (useful for environments without GPU access)
+    --no-framework-check          Skip LLM framework package checks (vllm, sglang, tensorrt_llm)
+    --cuda-consistency-check-only Only run and display CUDA major version consistency check (implies --thorough-check for CUDA)
+                                  Exit code 0 if consistent, 1 if inconsistent or GPU not available
 """
 
 import datetime
@@ -418,9 +422,10 @@ class SystemInfo(NodeInfo):
         self.add_child(os_info)
         self.add_child(UserInfo())
 
-        # Add GPU info (always show, even if not found) unless --no-gpu-check
-        if not self.no_gpu_check:
-            gpu_info = GPUInfo()
+        # Add GPU info (always show, even if not found) unless --no-gpu-check or --no-framework-check
+        # (GPU is primarily for framework usage, so skip if frameworks are skipped)
+        if not self.no_gpu_check and not self.no_framework_check:
+            gpu_info = GPUInfo(thorough_check=self.thorough_check)
             self.add_child(gpu_info)
 
         # Add Framework info (vllm, sglang, tensorrt_llm)
@@ -749,7 +754,8 @@ class OSInfo(NodeInfo):
 class GPUInfo(NodeInfo):
     """NVIDIA GPU information"""
 
-    def __init__(self):
+    def __init__(self, thorough_check: bool = False):
+        self.thorough_check = thorough_check
         # Find nvidia-smi executable (check multiple paths)
         nvidia_smi = shutil.which("nvidia-smi")
         if not nvidia_smi:
@@ -832,16 +838,8 @@ class GPUInfo(NodeInfo):
 
             # Handle single vs multiple GPUs
             if len(gpu_names) == 1:
-                # Single GPU - concise format
+                # Single GPU - just show GPU name in main label
                 value = gpu_names[0]
-                if driver or cuda:
-                    driver_cuda = []
-                    if driver:
-                        driver_cuda.append(f"driver {driver}")
-                    if cuda:
-                        driver_cuda.append(f"CUDA {cuda}")
-                    value += f", {', '.join(driver_cuda)}"
-
                 super().__init__(label="NVIDIA GPU", desc=value, status=NodeStatus.OK)
 
                 # Add power and memory metadata for single GPU
@@ -849,14 +847,6 @@ class GPUInfo(NodeInfo):
             else:
                 # Multiple GPUs - show count in main label
                 value = f"{len(gpu_names)} GPUs"
-                if driver or cuda:
-                    driver_cuda = []
-                    if driver:
-                        driver_cuda.append(f"driver {driver}")
-                    if cuda:
-                        driver_cuda.append(f"CUDA {cuda}")
-                    value += f", {', '.join(driver_cuda)}"
-
                 super().__init__(label="NVIDIA GPU", desc=value, status=NodeStatus.OK)
 
                 # Add each GPU as a child node
@@ -869,6 +859,14 @@ class GPUInfo(NodeInfo):
                     if power_mem:
                         gpu_child.add_metadata("Stats", power_mem)
                     self.add_child(gpu_child)
+
+            # Add nvidia-smi (driver max CUDA) and nvcc (installed toolkit) info
+            self._add_cuda_version_children(nvidia_smi, cuda, driver)
+
+            # Add CUDA consistency check in thorough mode
+            if self.thorough_check:
+                cuda_check = self._check_cuda_version_consistency()
+                self.add_child(cuda_check)
 
         except Exception:
             super().__init__(
@@ -904,6 +902,67 @@ class GPUInfo(NodeInfo):
         except Exception:
             pass
         return driver, cuda
+
+    def _add_cuda_version_children(
+        self, nvidia_smi: str, driver_cuda: Optional[str], driver_version: Optional[str]
+    ):
+        """Add child nodes showing driver, nvidia-smi (driver max) and nvcc (installed toolkit) versions."""
+        import re
+
+        # Add driver version
+        if driver_version:
+            driver_node = NodeInfo(
+                label="Driver version",
+                desc=driver_version,
+                status=NodeStatus.INFO,
+            )
+            self.add_child(driver_node)
+
+        # Add nvidia-smi CUDA version (driver's max supported version)
+        if driver_cuda:
+            smi_node = NodeInfo(
+                label="nvidia-smi CUDA",
+                desc=f"{driver_cuda} (driver max supported)",
+                status=NodeStatus.INFO,
+            )
+            self.add_child(smi_node)
+
+        # Add nvcc version (installed CUDA toolkit)
+        try:
+            result = subprocess.run(
+                ["nvcc", "--version"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode == 0:
+                # Extract version from output like "release 12.9, V12.9.41"
+                m = re.search(r"release\s+([0-9.]+)", result.stdout, re.IGNORECASE)
+                if m:
+                    nvcc_version = m.group(1)
+                    nvcc_node = NodeInfo(
+                        label="nvcc CUDA",
+                        desc=f"{nvcc_version} (installed toolkit)",
+                        status=NodeStatus.INFO,
+                    )
+                    self.add_child(nvcc_node)
+                else:
+                    nvcc_node = NodeInfo(
+                        label="nvcc CUDA",
+                        desc="version not detected",
+                        status=NodeStatus.WARNING,
+                    )
+                    self.add_child(nvcc_node)
+            else:
+                nvcc_node = NodeInfo(
+                    label="nvcc CUDA",
+                    desc="nvcc not found",
+                    status=NodeStatus.INFO,
+                )
+                self.add_child(nvcc_node)
+        except Exception:
+            # nvcc not available (not an error, just info)
+            pass
 
     def _add_power_memory_info(self, nvidia_smi: str, gpu_index: int = 0):
         """Add power and memory metadata for a specific GPU."""
@@ -964,6 +1023,416 @@ class GPUInfo(NodeInfo):
         except Exception:
             pass
         return None
+
+    def _check_cuda_version_consistency(self) -> NodeInfo:
+        """
+        Check CUDA major version consistency across environment variables,
+        system packages, and Python packages.
+
+        This check is adapted from tests/basic/test_cuda_version_consistency.py.
+        The detailed output (showing all 10 signals) is designed to help customers
+        and support engineers quickly diagnose CUDA version mismatches by providing
+        comprehensive environment information that can be copy/pasted into bug reports.
+
+        Returns a NodeInfo with OK status if consistent, WARNING/ERROR if inconsistent.
+        """
+        # Patterns to extract CUDA major version (12 or 13) from text
+        import re
+
+        def major_from_text(text: str) -> Optional[int]:
+            """Extract CUDA major version (10+) from arbitrary text; otherwise None."""
+            if not text:
+                return None
+
+            pats = [
+                r"\bCUDA_VERSION=([1-9]\d)\.",  # CUDA_VERSION=10.0, 11.0, 12.0, etc. (10-99)
+                r"\bNV_CUDA_.*?_VERSION=([1-9]\d)\.",  # NV_CUDA_CUDART_VERSION=10.0...
+                r"\+cuda([1-9]\d)\.",  # ...+cuda10.0
+                r"\bcuda\s*>=\s*([1-9]\d)\.",  # cuda>=10.0 ...
+                r"\brelease\s+([1-9]\d)\.",  # nvcc: release 10.0
+                r"-([1-9]\d)-\d+\b",  # dpkg: ...-10-0
+                r"\bcuda([1-9]\d)x\b",  # cupy-cuda10x (from name)
+                r"[-+]cu(1)([0-9])\d?\b",  # -cu100 or +cu129 (CUDA 10-19) - capture first 2 digits separately
+            ]
+            for i, pat in enumerate(pats):
+                m = re.search(pat, text, flags=re.IGNORECASE)
+                if m:
+                    # Special handling for cu### pattern (last pattern)
+                    if i == len(pats) - 1 and len(m.groups()) >= 2:
+                        # cu129 -> major=12 (first two digits)
+                        maj = int(m.group(1) + m.group(2))
+                    else:
+                        maj = int(m.group(1))
+                    if maj >= 10:  # Support CUDA 10 and above
+                        return maj
+            return None
+
+        def major_minor_from_text(text: str) -> Optional[str]:
+            """Extract CUDA major.minor (e.g., '12.9') from arbitrary text; otherwise None."""
+            if not text:
+                return None
+
+            pats = [
+                r"\bCUDA_VERSION=([1-9]\d)\.(\d+)",  # CUDA_VERSION=10.0.2 (10-99)
+                r"\bNV_CUDA_.*?_VERSION=([1-9]\d)\.(\d+)",  # NV_CUDA_CUDART_VERSION=10.0...
+                r"\+cuda([1-9]\d)\.(\d+)",  # ...+cuda10.0
+                r"\bcuda\s*>=\s*([1-9]\d)\.(\d+)",  # cuda>=10.0 ...
+                r"\brelease\s+([1-9]\d)\.(\d+)",  # nvcc: release 10.0
+                r"\bCUDA Version:\s+([1-9]\d)\.(\d+)",  # nvidia-smi: CUDA Version: 10.0
+            ]
+            for pat in pats:
+                m = re.search(pat, text, flags=re.IGNORECASE)
+                if m:
+                    maj = int(m.group(1))
+                    if maj >= 10:  # Support CUDA 10 and above
+                        return f"{m.group(1)}.{m.group(2)}"
+            return None
+
+        def dpkg_major_minor_from_lines(lines: list) -> Optional[str]:
+            """Extract major.minor from dpkg package names like 'cuda-toolkit-12-9'."""
+            if not lines:
+                return None
+
+            # Look for pattern like "-12-9" in package names (CUDA 10+)
+            for line in lines:
+                # Pattern: package-name-10-0 or package-name-12-9 (dpkg uses dash instead of dot)
+                m = re.search(r"-([1-9]\d)-(\d+)\b", line)
+                if m:
+                    maj = int(m.group(1))
+                    if maj >= 10:  # Support CUDA 10 and above
+                        return f"{m.group(1)}.{m.group(2)}"
+            return None
+
+        def sh(cmd: str) -> str:
+            """Run command and return stdout only."""
+            try:
+                p = subprocess.run(
+                    ["bash", "-c", f"{cmd} 2>/dev/null"],
+                    stdout=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                    timeout=10,
+                )
+                return (p.stdout or "").strip()
+            except Exception:
+                return ""
+
+        # Easy to edit later (matching test_cuda_version_consistency.py)
+        IGNORE_PIP_PREFIXES = ("cupy", "nixl")
+
+        def keep_pip_line(line: str) -> bool:
+            """Ignore some packages from pip signal."""
+            name = line.split("==", 1)[0].strip().lower()
+            return not name.startswith(IGNORE_PIP_PREFIXES)
+
+        # Define signals to check
+        signals = [
+            ("nvidia-smi (driver max)", "nvidia-smi | grep 'CUDA Version'"),
+            (
+                "nvcc (installed toolkit)",
+                "nvcc --version | grep -i 'release' || nvcc --version",
+            ),
+            ("env:CUDA_VERSION", "env | grep -i '^CUDA_VERSION='"),
+            ("env:NV_CUDA_CUDART_VERSION", "env | grep -i '^NV_CUDA_CUDART_VERSION='"),
+            ("env:NV_CUDA_LIB_VERSION", "env | grep -i '^NV_CUDA_LIB_VERSION='"),
+            ("env:NV_LIBNCCL_PACKAGE", "env | grep -i '^NV_LIBNCCL_PACKAGE='"),
+            ("env:NVIDIA_REQUIRE_CUDA", "env | grep -i '^NVIDIA_REQUIRE_CUDA='"),
+            ("dpkg:cuda-*", "dpkg -l | grep -E '^(ii|hi)\\s+cuda-.*-[1-9][0-9]-'"),
+            (
+                "dpkg:libcublas/libnccl",
+                "dpkg -l | grep -E '^(ii|hi)\\s+lib(cublas|nccl).*-[1-9][0-9]-'",
+            ),
+            (
+                "pip:selected",
+                "python -m pip list --format=freeze | grep -Ei '(cuda|cudnn|nccl|nvshmem|\\+cu[1-9][0-9]|-cu[1-9][0-9]|^(torch|torchaudio|torchvision)==)'",
+            ),
+        ]
+
+        rows: List[Tuple[str, Optional[int], Optional[str], List[str]]] = []
+
+        for label, cmd in signals:
+            out = sh(cmd)
+            lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+
+            if label.startswith("pip:"):
+                lines = [ln for ln in lines if keep_pip_line(ln)]
+                majors = {major_from_text(ln) for ln in lines}
+                majors.discard(None)
+                maj = (
+                    majors.pop() if len(majors) == 1 else None
+                )  # None if ambiguous/mixed
+                maj_min = None  # Don't show major.minor for pip aggregates
+            elif label.startswith("dpkg:"):
+                # For dpkg, extract major.minor from package names like "cuda-toolkit-12-9"
+                maj = major_from_text(out)
+                maj_min = dpkg_major_minor_from_lines(lines)
+            else:
+                maj = major_from_text(out)
+                maj_min = major_minor_from_text(out)
+
+            rows.append((label, maj, maj_min, lines if lines else ["<no output>"]))
+
+        # Compute all detected majors across all signals
+        detected: List[int] = []
+        for label, maj, maj_min, lines in rows:
+            if label.startswith("pip:"):
+                for ln in lines:
+                    m = major_from_text(ln)
+                    if m is not None:
+                        detected.append(m)
+            else:
+                if maj is not None:
+                    detected.append(maj)
+
+        if not detected:
+            return NodeInfo(
+                label="CUDA major version consistency",
+                desc="no CUDA major version detected",
+                status=NodeStatus.INFO,
+            )
+
+        unique = sorted(set(detected))
+
+        # Build a readable report
+        ignored_prefixes_str = ", ".join(IGNORE_PIP_PREFIXES)
+
+        # Check for CUDA versions < 10 (error condition)
+        old_versions = [v for v in unique if v < 10]
+        if old_versions:
+            node = NodeInfo(
+                label="CUDA major version consistency",
+                desc=f"unsupported CUDA version(s) detected: {old_versions} (CUDA >= 10 required)",
+                status=NodeStatus.ERROR,
+            )
+            node.add_metadata("Ignored pip prefixes", ignored_prefixes_str)
+            # Show all signals to help debug the issue
+            for label, maj, maj_min, lines in rows:
+                if maj and maj < 10:
+                    maj_s = f"{maj_min}" if maj_min else str(maj)
+                    signal_node = NodeInfo(
+                        label=f"{maj_s:>4}  {label}",
+                        desc="⚠️ UNSUPPORTED VERSION",
+                        status=NodeStatus.ERROR,
+                    )
+                    node.add_child(signal_node)
+            return node
+
+        if len(unique) == 1:
+            # Consistent major version
+            # Check for minor version mismatches
+            minor_versions = set()
+            for label, maj, maj_min, lines in rows:
+                if maj_min and not label.startswith("pip:"):
+                    minor_versions.add(maj_min)
+
+            # If we have multiple minor versions, show a warning
+            if len(minor_versions) > 1:
+                node = NodeInfo(
+                    label="CUDA major version consistency",
+                    desc=f"CUDA {unique[0]} consistent, but minor versions vary: {sorted(minor_versions)}",
+                    status=NodeStatus.WARNING,
+                )
+            else:
+                node = NodeInfo(
+                    label="CUDA major version consistency",
+                    desc=f"CUDA {unique[0]} (consistent across all signals)",
+                    status=NodeStatus.OK,
+                )
+            # Add summary metadata
+            node.add_metadata("Checked signals", str(len(signals)))
+            node.add_metadata("Ignored pip prefixes", ignored_prefixes_str)
+
+            # Show all signal details as children (in thorough mode, always show breakdown)
+            for label, maj, maj_min, lines in rows:
+                # Display major.minor if available, otherwise just major, otherwise "-"
+                if maj_min:
+                    maj_s = maj_min
+                elif maj is not None:
+                    maj_s = str(maj)
+                else:
+                    maj_s = "-"
+
+                # Special handling for nvidia-smi and nvcc: show on one line
+                if label in ("nvidia-smi (driver max)", "nvcc (installed toolkit)"):
+                    # Skip if no output (e.g., nvcc not installed)
+                    if not lines or lines[0] == "<no output>":
+                        # Skip showing this signal if not available
+                        pass
+                    else:
+                        # Clean up the output: remove extra pipes and spaces
+                        cleaned_line = ""
+                        ln = lines[0]
+                        # For nvidia-smi, extract just "NVIDIA-SMI X.X.X Driver Version: X.X.X CUDA Version: X.X"
+                        if label == "nvidia-smi (driver max)":
+                            import re
+
+                            # Extract the key info without the pipe decorations
+                            parts = []
+                            if m := re.search(r"NVIDIA-SMI\s+([\d.]+)", ln):
+                                parts.append(f"NVIDIA-SMI {m.group(1)}")
+                            if m := re.search(r"Driver Version:\s+([\d.]+)", ln):
+                                parts.append(f"Driver {m.group(1)}")
+                            if m := re.search(r"CUDA Version:\s+([\d.]+)", ln):
+                                parts.append(f"CUDA {m.group(1)}")
+                            cleaned_line = (
+                                ", ".join(parts) if parts else ln.strip("|").strip()
+                            )
+                        else:
+                            # For nvcc, use as-is
+                            cleaned_line = ln
+
+                        signal_node = NodeInfo(
+                            label=f"{maj_s:>4}  {label}",
+                            desc=cleaned_line,
+                            status=NodeStatus.INFO,
+                        )
+                        node.add_child(signal_node)
+                # Special handling for env vars: show on one line
+                elif label.startswith("env:"):
+                    # Show the environment variable value on the same line (full value, no truncation)
+                    if lines and lines[0] != "<no output>":
+                        env_value = lines[0]
+                        signal_node = NodeInfo(
+                            label=f"{maj_s:>4}  {env_value}",
+                            desc="",
+                            status=NodeStatus.INFO,
+                        )
+                        node.add_child(signal_node)
+                    else:
+                        # Skip showing env vars that aren't set (no output)
+                        # This avoids cluttering the output with blank lines
+                        pass
+                else:
+                    # Regular handling: show lines as children (dpkg, pip)
+                    signal_node = NodeInfo(
+                        label=f"{maj_s:>4}  {label}",
+                        desc="",
+                        status=NodeStatus.INFO,
+                    )
+                    # Show all lines (no limit for customer diagnostics)
+                    for ln in lines:
+                        # Truncate very long lines (like NVIDIA_REQUIRE_CUDA)
+                        if len(ln) > 200:
+                            # Extract first meaningful part
+                            if "cuda>=" in ln.lower():
+                                # Extract just the cuda>= requirement
+                                import re
+
+                                m = re.search(r"(cuda>=[\d.]+)", ln, re.IGNORECASE)
+                                if m:
+                                    ln = f"{ln.split('=')[0]}={m.group(1)} ... (truncated)"
+                                else:
+                                    ln = ln[:200] + "... (truncated)"
+                            else:
+                                ln = ln[:200] + "... (truncated)"
+                        # Create child node for each line instead of using metadata
+                        line_node = NodeInfo(
+                            label=ln, status=NodeStatus.NONE, show_symbol=False
+                        )
+                        signal_node.add_child(line_node)
+                    node.add_child(signal_node)
+
+            return node
+        else:
+            # Inconsistent
+            node = NodeInfo(
+                label="CUDA major version consistency",
+                desc=f"inconsistent CUDA majors detected: {unique}",
+                status=NodeStatus.ERROR,
+            )
+            node.add_metadata("Ignored pip prefixes", ignored_prefixes_str)
+
+            # Add detailed breakdown as children
+            for label, maj, maj_min, lines in rows:
+                # Display major.minor if available, otherwise just major, otherwise "-"
+                if maj_min:
+                    maj_s = maj_min
+                elif maj is not None:
+                    maj_s = str(maj)
+                else:
+                    maj_s = "-"
+
+                # Special handling for nvidia-smi and nvcc: show on one line
+                if label in ("nvidia-smi (driver max)", "nvcc (installed toolkit)"):
+                    # Skip if no output (e.g., nvcc not installed)
+                    if not lines or lines[0] == "<no output>":
+                        # Skip showing this signal if not available
+                        pass
+                    else:
+                        # Clean up the output: remove extra pipes and spaces
+                        cleaned_line = ""
+                        ln = lines[0]
+                        # For nvidia-smi, extract just "NVIDIA-SMI X.X.X Driver Version: X.X.X CUDA Version: X.X"
+                        if label == "nvidia-smi (driver max)":
+                            import re
+
+                            # Extract the key info without the pipe decorations
+                            parts = []
+                            if m := re.search(r"NVIDIA-SMI\s+([\d.]+)", ln):
+                                parts.append(f"NVIDIA-SMI {m.group(1)}")
+                            if m := re.search(r"Driver Version:\s+([\d.]+)", ln):
+                                parts.append(f"Driver {m.group(1)}")
+                            if m := re.search(r"CUDA Version:\s+([\d.]+)", ln):
+                                parts.append(f"CUDA {m.group(1)}")
+                            cleaned_line = (
+                                ", ".join(parts) if parts else ln.strip("|").strip()
+                            )
+                        else:
+                            # For nvcc, use as-is
+                            cleaned_line = ln
+
+                        signal_node = NodeInfo(
+                            label=f"{maj_s:>4}  {label}",
+                            desc=cleaned_line,
+                            status=NodeStatus.INFO,
+                        )
+                        node.add_child(signal_node)
+                # Special handling for env vars: show on one line (FULL output in error mode, no truncation)
+                elif label.startswith("env:"):
+                    # Show the environment variable value on the same line
+                    if lines and lines[0] != "<no output>":
+                        env_value = lines[0]
+                        signal_node = NodeInfo(
+                            label=f"{maj_s:>4}  {env_value}",
+                            desc="",
+                            status=NodeStatus.INFO,
+                        )
+                        node.add_child(signal_node)
+                    else:
+                        # Skip showing env vars that aren't set (no output)
+                        # This avoids cluttering the output with blank lines
+                        pass
+                else:
+                    # Regular handling: show lines as children (dpkg, pip)
+                    signal_node = NodeInfo(
+                        label=f"{maj_s:>4}  {label}",
+                        desc="",
+                        status=NodeStatus.INFO,
+                    )
+                    # Show all lines (no limit for customer diagnostics)
+                    for ln in lines:
+                        # Truncate very long lines (like NVIDIA_REQUIRE_CUDA)
+                        if len(ln) > 200:
+                            # Extract first meaningful part
+                            if "cuda>=" in ln.lower():
+                                # Extract just the cuda>= requirement
+                                import re
+
+                                m = re.search(r"(cuda>=[\d.]+)", ln, re.IGNORECASE)
+                                if m:
+                                    ln = f"{ln.split('=')[0]}={m.group(1)} ... (truncated)"
+                                else:
+                                    ln = ln[:200] + "... (truncated)"
+                            else:
+                                ln = ln[:200] + "... (truncated)"
+                        # Create child node for each line instead of using metadata
+                        line_node = NodeInfo(
+                            label=ln, status=NodeStatus.NONE, show_symbol=False
+                        )
+                        signal_node.add_child(line_node)
+                    node.add_child(signal_node)
+
+            return node
 
 
 class FilePermissionsInfo(NodeInfo):
@@ -1586,9 +2055,17 @@ class HuggingFaceInfo(NodeInfo):
         """Initialize when models are found in cache."""
         model_count = len(models)
         display_path = self._replace_home_with_var(hf_cache_path)
+
+        # Check if cache is on NFS or host mount
+        mount_type = self._get_mount_type(hf_cache_path)
+
+        desc = f"{model_count} models in {display_path}"
+        if mount_type:
+            desc += f" ({mount_type})"
+
         super().__init__(
             label="Hugging Face Cache",
-            desc=f"{model_count} models in {display_path}",
+            desc=desc,
             status=NodeStatus.OK,
         )
 
@@ -1634,6 +2111,61 @@ class HuggingFaceInfo(NodeInfo):
                 status=NodeStatus.INFO,
             )
             self.add_child(token_node)
+
+    def _get_mount_type(self, path: str) -> Optional[str]:
+        """Determine if path is on NFS or a host mount (bind mount).
+
+        Returns:
+            String describing mount type (e.g., "NFS", "host mount") or None if local
+        """
+        try:
+            # Read /proc/mounts to find mount info
+            with open("/proc/mounts", "r") as f:
+                mounts = f.readlines()
+
+            # Find the longest matching mount point (most specific)
+            abs_path = os.path.abspath(path)
+            best_match = None
+            best_match_len = 0
+
+            for line in mounts:
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                mount_point = parts[1]
+                fs_type = parts[2]
+
+                # Check if our path is under this mount point
+                if (
+                    abs_path.startswith(mount_point)
+                    and len(mount_point) > best_match_len
+                ):
+                    best_match = (mount_point, fs_type)
+                    best_match_len = len(mount_point)
+
+            if best_match:
+                mount_point, fs_type = best_match
+
+                # Check for NFS
+                if fs_type in ("nfs", "nfs4"):
+                    return "NFS"
+
+                # Check for bind mount (host mount in Docker)
+                # In Docker, bind mounts typically show up with device paths or overlay
+                if fs_type in ("ext4", "xfs", "btrfs") and mount_point != "/":
+                    # This could be a bind mount from host
+                    # Additional heuristic: check if device is different from root
+                    try:
+                        root_stat = os.stat("/")
+                        path_stat = os.stat(abs_path)
+                        if root_stat.st_dev != path_stat.st_dev:
+                            return "host mount"
+                    except Exception:
+                        pass
+
+            return None
+        except Exception:
+            return None
 
     def _get_cached_models(self, cache_path: str, compute_sizes: bool) -> List[tuple]:
         """Get list of cached Hugging Face models with metadata.
@@ -2020,7 +2552,7 @@ class MaturinInfo(NodeInfo):
 class PythonInfo(NodeInfo):
     """Python installation information.
 
-    In `--runtime-check` mode, Python is still useful to report, but failures should not
+    In `--runtime-check-only` mode, Python is still useful to report, but failures should not
     block the container sanity check, so missing/broken Python is downgraded to WARNING.
     """
 
@@ -2975,7 +3507,7 @@ def main():
     parser.add_argument(
         "--thorough-check",
         action="store_true",
-        help="Enable thorough checking (file permissions, directory sizes, disk space, etc.)",
+        help="Enable thorough checking (file permissions, directory sizes, disk space, CUDA major version consistency, etc.)",
     )
     parser.add_argument(
         "--terse",
@@ -2990,8 +3522,10 @@ def main():
         help="Output a JSON representation (terse subset) suitable for copy/paste",
     )
     parser.add_argument(
+        "--runtime-check-only",
         "--runtime-check",
         "--runtime",
+        dest="runtime_check",
         action="store_true",
         help="Skip compile-time dependency checks (Rust, Cargo, Maturin) for runtime containers and validate ai-dynamo packages",
     )
@@ -3006,6 +3540,12 @@ def main():
         action="store_true",
         help="Skip LLM framework package checks (vllm, sglang, tensorrt_llm)",
     )
+    parser.add_argument(
+        "--cuda-consistency-check-only",
+        dest="cuda_only",
+        action="store_true",
+        help="Only run and display CUDA major version consistency check (implies --thorough-check for CUDA)",
+    )
     args = parser.parse_args()
 
     # Validate mutual exclusion
@@ -3017,6 +3557,35 @@ def main():
         parser.error(
             "--json-output and --terse cannot be used together (json-output is already terse)"
         )
+    if args.cuda_only and (args.terse or args.json_output):
+        parser.error(
+            "--cuda-consistency-check-only cannot be used with --terse or --json-output"
+        )
+
+    # Handle CUDA-only mode: just run the check and exit
+    if args.cuda_only:
+        print("Running CUDA major version consistency check...")
+        print("=" * 70)
+        gpu_info = GPUInfo(thorough_check=True)
+
+        # Find the CUDA consistency check child
+        cuda_check = None
+        for child in gpu_info.children:
+            if "CUDA major version consistency" in child.label:
+                cuda_check = child
+                break
+
+        if cuda_check:
+            cuda_check.print_tree()
+            # Exit with error if inconsistent
+            if cuda_check.status == NodeStatus.ERROR:
+                sys.exit(1)
+            else:
+                sys.exit(0)
+        else:
+            print("❌ CUDA consistency check not found (GPU may not be available)")
+            sys.exit(1)
+
     # Keep `--json-output` output JSON-only for copy/paste (no Python warnings noise).
     if args.json_output:
         import warnings
