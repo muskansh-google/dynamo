@@ -12,7 +12,10 @@ import uvloop
 
 from dynamo.common.config_dump import dump_config
 from dynamo.common.utils.endpoint_types import parse_endpoint_types
-from dynamo.llm import ModelInput, ModelType
+from dynamo.llm import (
+    ModelInput,
+    ModelType,
+)
 from dynamo.runtime import DistributedRuntime
 from dynamo.runtime.logging import configure_dynamo_logging
 from dynamo.sglang.args import Config, DisaggregationMode, parse_args
@@ -202,9 +205,7 @@ async def init(runtime: DistributedRuntime, config: Config):
 
     runtime.register_engine_route("start_profile", start_profile_handler)
     runtime.register_engine_route("stop_profile", stop_profile_handler)
-    logging.info(
-        "Registered engine routes: /engine/start_profile, /engine/stop_profile"
-    )
+    logging.info("Registered engine routes: /engine/start_profile, /engine/stop_profile")
 
     # publisher instantiates the metrics and kv event publishers
     publisher, metrics_task, metrics_labels = await setup_sgl_metrics(
@@ -215,10 +216,26 @@ async def init(runtime: DistributedRuntime, config: Config):
     if engine.server_args.enable_metrics:
         setup_prometheus_registry(engine, generate_endpoint)
 
+    # Create handler with endpoint for memory management operations
+    handler = DecodeWorkerHandler(
+        component, engine, config, publisher, generate_endpoint=generate_endpoint
+    )
+
+    # Register memory management routes
+    async def release_memory_handler(body: dict) -> dict:
+        return await handler.release_memory_occupation(body, gpu_memory_service_active=_gpu_memory_service_setup_done)
+
+    async def resume_memory_handler(body: dict) -> dict:
+        return await handler.resume_memory_occupation(body)
+
+    runtime.register_engine_route("release_memory_occupation", release_memory_handler)
+    runtime.register_engine_route("resume_memory_occupation", resume_memory_handler)
+    logging.info(
+        "Registered engine routes: /engine/release_memory_occupation, /engine/resume_memory_occupation"
+    )
+
     # Readiness gate: requests wait until model is registered
     ready_event = asyncio.Event()
-
-    handler = DecodeWorkerHandler(component, engine, config, publisher)
     print(f"Config: {config}")
     health_check_payload = SglangHealthCheckPayload(
         engine, use_text_input=dynamo_args.use_sglang_tokenizer
@@ -302,9 +319,7 @@ async def init_prefill(runtime: DistributedRuntime, config: Config):
 
     runtime.register_engine_route("start_profile", start_profile_handler)
     runtime.register_engine_route("stop_profile", stop_profile_handler)
-    logging.info(
-        "Registered engine routes: /engine/start_profile, /engine/stop_profile"
-    )
+    logging.info("Registered engine routes: /engine/start_profile, /engine/stop_profile")
 
     # Perform dummy warmup for prefill worker to avoid initial TTFT hit
     # Only needed on leader node that handles requests
@@ -319,7 +334,23 @@ async def init_prefill(runtime: DistributedRuntime, config: Config):
     if engine.server_args.enable_metrics:
         setup_prometheus_registry(engine, generate_endpoint)
 
-    handler = PrefillWorkerHandler(component, engine, config, publisher)
+    # Create handler with endpoint for memory management operations
+    handler = PrefillWorkerHandler(
+        component, engine, config, publisher, generate_endpoint=generate_endpoint
+    )
+
+    # Register memory management routes
+    async def release_memory_handler(body: dict) -> dict:
+        return await handler.release_memory_occupation(body, gpu_memory_service_active=_gpu_memory_service_setup_done)
+
+    async def resume_memory_handler(body: dict) -> dict:
+        return await handler.resume_memory_occupation(body)
+
+    runtime.register_engine_route("release_memory_occupation", release_memory_handler)
+    runtime.register_engine_route("resume_memory_occupation", resume_memory_handler)
+    logging.info(
+        "Registered engine routes: /engine/release_memory_occupation, /engine/resume_memory_occupation"
+    )
 
     health_check_payload = SglangPrefillHealthCheckPayload(engine).to_dict()
 

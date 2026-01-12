@@ -17,6 +17,7 @@ from sglang.srt.utils import get_local_ip_auto
 
 from dynamo._core import Component, Context
 from dynamo.common.utils.input_params import InputParamManager
+from dynamo.llm import register_endpoint_instance, unregister_endpoint_instance
 from dynamo.sglang.args import Config
 from dynamo.sglang.publisher import DynamoSglangPublisher
 
@@ -30,6 +31,7 @@ class BaseWorkerHandler(ABC):
         engine: sgl.Engine,
         config: Config,
         publisher: Optional[DynamoSglangPublisher] = None,
+        generate_endpoint=None,
     ) -> None:
         """Initialize base worker handler.
 
@@ -38,10 +40,12 @@ class BaseWorkerHandler(ABC):
             engine: The SGLang engine instance.
             config: SGLang and Dynamo configuration.
             publisher: Optional metrics publisher for the worker.
+            generate_endpoint: Optional endpoint for memory management operations.
         """
         self.component = component
         self.engine = engine
         self.config = config
+        self.generate_endpoint = generate_endpoint
         if publisher is not None:
             self.metrics_publisher = publisher.metrics_publisher
             self.kv_publisher = publisher.kv_publisher
@@ -74,6 +78,117 @@ class BaseWorkerHandler(ABC):
     def cleanup(self) -> None:
         """Cleanup resources. Override in subclasses as needed."""
         pass
+
+    async def release_memory_occupation(
+        self, body: dict, gpu_memory_service_active: bool = False
+    ) -> dict:
+        """Release GPU memory occupation and unregister from discovery.
+
+        Args:
+            body: Request body with optional 'tags' or 'tag' field.
+                  Valid tags: "kv_cache", "weights", "cuda_graph".
+                  Default: all tags.
+            gpu_memory_service_active: Whether GPU Memory Service is active.
+
+        Returns:
+            Status dict with "status" and "message" fields.
+        """
+        # Support both "tag" (single) and "tags" (list) for flexibility
+        tags = body.get("tags", body.get("tag", None))
+        if tags is None:
+            tags = ["kv_cache", "weights", "cuda_graph"]
+        elif isinstance(tags, str):
+            tags = [tags]
+
+        if "weights" in tags and gpu_memory_service_active:
+            logging.warning(
+                "[ReleaseMemory] 'weights' tag included but GPU Memory Service is active. "
+                "Weight memory is managed by GPU Memory Service and will not be freed via this endpoint."
+            )
+
+        try:
+            # Step 1: Unregister endpoint instance to remove from routing table
+            if self.generate_endpoint is not None:
+                try:
+                    await unregister_endpoint_instance(self.generate_endpoint)
+                    logging.info(
+                        "[ReleaseMemory] Unregistered endpoint instance - frontend will stop routing here"
+                    )
+                except Exception as unreg_err:
+                    logging.warning(
+                        f"[ReleaseMemory] Failed to unregister endpoint instance: {unreg_err}"
+                    )
+
+            # Step 2: Pause generation with abort mode to drain/abort existing requests
+            from sglang.srt.managers.io_struct import (
+                PauseGenerationReqInput,
+                ReleaseMemoryOccupationReqInput,
+            )
+
+            pause_obj = PauseGenerationReqInput(mode="abort")
+            await self.engine.tokenizer_manager.pause_generation(pause_obj)
+            logging.info("[ReleaseMemory] Paused generation and drained all requests")
+
+            # Step 3: Now safe to release memory - no requests in flight
+            obj = ReleaseMemoryOccupationReqInput(tags=tags)
+            await self.engine.tokenizer_manager.release_memory_occupation(obj, None)
+            logging.info(f"[ReleaseMemory] Released memory occupation for tags: {tags}")
+
+            return {"status": "ok", "message": f"Memory released (tags={tags})"}
+        except Exception as e:
+            logging.error(f"Failed to release memory occupation: {e}")
+            return {"status": "error", "message": str(e)}
+
+    async def resume_memory_occupation(self, body: dict) -> dict:
+        """Resume GPU memory occupation and re-register to discovery.
+
+        Args:
+            body: Request body with optional 'tags' or 'tag' field.
+                  Valid tags: "kv_cache", "weights", "cuda_graph".
+                  Default: all tags.
+
+        Returns:
+            Status dict with "status" and "message" fields.
+        """
+        # Support both "tag" (single) and "tags" (list) for flexibility
+        tags = body.get("tags", body.get("tag", None))
+        if tags is None:
+            tags = ["kv_cache", "weights", "cuda_graph"]
+        elif isinstance(tags, str):
+            tags = [tags]
+
+        try:
+            from sglang.srt.managers.io_struct import (
+                ContinueGenerationReqInput,
+                ResumeMemoryOccupationReqInput,
+            )
+
+            # Step 1: Resume memory occupation
+            obj = ResumeMemoryOccupationReqInput(tags=tags)
+            await self.engine.tokenizer_manager.resume_memory_occupation(obj, None)
+            logging.info(f"[ResumeMemory] Resumed memory occupation for tags: {tags}")
+
+            # Step 2: Continue generation (unpause the engine)
+            continue_obj = ContinueGenerationReqInput()
+            await self.engine.tokenizer_manager.continue_generation(continue_obj)
+            logging.info("[ResumeMemory] Continued generation - engine unpaused")
+
+            # Step 3: Re-register to discovery so frontend can route to us again
+            if self.generate_endpoint is not None:
+                try:
+                    await register_endpoint_instance(self.generate_endpoint)
+                    logging.info(
+                        "[ResumeMemory] Re-registered endpoint instance - frontend can route here"
+                    )
+                except Exception as reg_err:
+                    logging.warning(
+                        f"[ResumeMemory] Failed to re-register endpoint instance: {reg_err}"
+                    )
+
+            return {"status": "ok", "message": f"Memory resumed (tags={tags})"}
+        except Exception as e:
+            logging.error(f"Failed to resume memory occupation: {e}")
+            return {"status": "error", "message": str(e)}
 
     def _get_input_param(self, request: Dict[str, Any]) -> Dict[str, Any]:
         request_input = self.input_param_manager.get_input_param(
