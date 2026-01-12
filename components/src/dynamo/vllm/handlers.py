@@ -24,7 +24,9 @@ from dynamo.llm import (
     ModelType,
     ZmqKvEventPublisher,
     lora_name_to_id,
+    register_endpoint_instance,
     register_llm,
+    unregister_endpoint_instance,
     unregister_llm,
 )
 from dynamo.runtime.logging import configure_dynamo_logging
@@ -267,6 +269,69 @@ class BaseWorkerHandler(ABC):
         if use_vllm_tokenizer and hasattr(engine, "tokenizer"):
             tokenizer = engine.tokenizer
         self.input_param_manager = InputParamManager(tokenizer)
+
+    async def sleep(self, body: dict) -> dict:
+        """Sleep the engine to release GPU memory and unregister from discovery.
+
+        Args:
+            body: Dict with optional 'level' key (1=weights only, 2=weights+buffers, 3=everything)
+
+        Order of operations:
+        1. Unregister from discovery - stop accepting new requests
+        2. Sleep engine - safe now that no new requests will arrive
+        """
+        level = body.get("level", 1)
+        try:
+            # Step 1: Unregister endpoint instance FIRST to stop new requests from arriving
+            # This removes the worker from the routing pool entirely (not just the model card)
+            try:
+                await unregister_endpoint_instance(self.generate_endpoint)
+                logger.info(
+                    "[Sleep] Unregistered endpoint from discovery - worker removed from routing pool"
+                )
+            except Exception as unreg_err:
+                logger.warning(
+                    f"[Sleep] Failed to unregister endpoint from discovery: {unreg_err}"
+                )
+
+            # Step 2: Now safe to sleep - no new requests will be routed here
+            await self.engine_client.sleep(level)
+
+            return {"status": "ok", "message": f"Engine slept (level={level})"}
+        except Exception as e:
+            logger.error(f"Failed to sleep engine: {e}")
+            return {"status": "error", "message": str(e)}
+
+    async def wake(self, body: dict) -> dict:
+        """Wake the engine to restore GPU memory and re-register to discovery.
+
+        Args:
+            body: Dict with optional 'tags' key (e.g., ["weights", "kv_cache"]). None wakes all.
+
+        Order of operations:
+        1. Wake engine - restore GPU memory
+        2. Re-register endpoint instance - allow frontend to route requests here again
+        """
+        tags = body.get("tags")
+        try:
+            # Step 1: Wake engine first - must be ready before accepting requests
+            await self.engine_client.wake_up(tags)
+
+            # Step 2: Re-register endpoint instance to discovery so frontend can route to us again
+            try:
+                await register_endpoint_instance(self.generate_endpoint)
+                logger.info(
+                    "[Wake] Re-registered endpoint to discovery - worker added back to routing pool"
+                )
+            except Exception as reg_err:
+                logger.warning(
+                    f"[Wake] Failed to re-register endpoint to discovery: {reg_err}"
+                )
+
+            return {"status": "ok", "message": f"Engine woke (tags={tags})"}
+        except Exception as e:
+            logger.error(f"Failed to wake engine: {e}")
+            return {"status": "error", "message": str(e)}
 
     @abstractmethod
     async def generate(self, request, context) -> AsyncGenerator[dict, None]:
